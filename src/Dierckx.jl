@@ -6,7 +6,9 @@ export Spline1D,
        Spline2D,
        ParametricSpline,
        evaluate,
+       evaluate!,
        derivative,
+       derivative!,
        integrate,
        roots,
        evalgrid,
@@ -409,18 +411,21 @@ end
 
 mutable struct ParametricSpline
     t::Vector{Float64}
-    c::Matrix{Float64}
+    c::Vector{Float64}
     k::Int
     bc::Int
     fp::Float64
     wrk::Vector{Float64}
+    idim::Int
+    n::Int
 end
 
-ParametricSpline(t, c, k, bc, fp) =
-    ParametricSpline(t, c, k, bc, fp, Vector{Float64}(undef, length(t)))
+ParametricSpline(t, c, k, bc, fp, idim, n) =
+    ParametricSpline(t, c, k, bc, fp, Vector{Float64}(undef, length(c)), idim, n)
 
-get_knots(spl::ParametricSpline) = spl.t[spl.k+1:end-spl.k]
-get_coeffs(spl::ParametricSpline) = spl.c[:, 1:end-spl.k+1]
+get_knots(spl::ParametricSpline) = spl.t[spl.k+1:spl.n-spl.k]
+get_coeffs(spl::ParametricSpline) =
+    [spl.c[spl.n*(j-1) + i] for j=1:spl.idim, i=1:spl.n-2*spl.k]
 get_residual(spl::ParametricSpline) = spl.fp
 
 function show(io::IO, spl::ParametricSpline)
@@ -576,42 +581,115 @@ function _ParametricSpline(u::Union{AbstractVector, Nothing}, x::AbstractMatrix,
     resize!(t, n[])
     c = [c[n[]*(j-1) + i] for j=1:idim, i=1:n[]-k-1]
 
-    return ParametricSpline(t, c, k, _translate_bc(bc), fp[])
+    return ParametricSpline(t, c, k, _translate_bc(bc), fp[], idim, n[])
 end
 
-_evaluate(t::Vector{Float64}, c::Matrix{Float64}, k::Int,
-          x::Vector{Float64}, bc::Int) =
-    mapslices(v -> _evaluate(t, v, k, x, bc), c, dims=[2])
+function _evaluate!(x::Matrix{Float64}, t::Vector{Float64}, c::Vector{Float64},
+                    k::Int, u::Vector{Float64}, bc::Int, idim::Int, n::Int)
+    bc in (0, 1, 2, 3) || error("bc = $bc not in (0, 1, 2, 3)")
+    m = length(u)
+    size(x, 1) == idim && size(x, 2) == m || error("x must be of size ($idim, $m)")
+    ier = Ref{Int32}(0)
+    ccall((:curev_, libddierckx), Nothing,
+         (Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Int32},
+          Ref{Float64}, Ref{Int32},
+          Ref{Float64}, Ref{Int32},
+          Ref{Int32}, Ref{Int32}),
+         idim, t, n, c, length(c), k, u, m, x, length(x), bc, ier)
 
-_evaluate(t::Vector{Float64}, c::Matrix{Float64}, k::Int,
-          x::Real, bc::Int) =
-    vec(mapslices(v -> _evaluate(t, v, k, x, bc), c, dims=[2]))
-
-function evaluate(spline::ParametricSpline, x::AbstractVector)
-    xin = convert(Vector{Float64}, x)
-    _evaluate(spline.t, spline.c, spline.k, xin, spline.bc)
+    ier[] == 0 || error(_eval1d_messages[ier[]])
+    return x
 end
 
-evaluate(spline::ParametricSpline, x::Real) =
-    _evaluate(spline.t, spline.c, spline.k, x, spline.bc)
+function _evaluate!(x::Vector{Float64}, t::Vector{Float64}, c::Vector{Float64},
+                    k::Int, u::Real, bc::Int, idim::Int, n::Int)
+    bc in (0, 1, 2, 3) || error("bc = $bc not in (0, 1, 2, 3)")
+    length(x) == idim || error("x must be of length $idim")
+    ier = Ref{Int32}(0)
+    ccall((:curev_, libddierckx), Nothing,
+         (Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Int32},
+          Ref{Float64}, Ref{Int32},
+          Ref{Float64}, Ref{Int32},
+          Ref{Int32}, Ref{Int32}),
+         idim, t, n, c, length(c), k, Float64(u), 1, x, length(x), bc, ier)
 
-_derivative(t::Vector{Float64}, c::Matrix{Float64}, k::Int,
-            x::Vector{Float64}, nu::Int, bc::Int, wrk::Vector{Float64}) =
-    mapslices(v -> _derivative(t, v, k, x, nu, bc, wrk), c, dims=[2])
+    ier[] == 0 || error(_eval1d_messages[ier[]])
+    return x
+end
 
-_derivative(t::Vector{Float64}, c::Matrix{Float64}, k::Int,
-            x::Real, nu::Int, bc::Int, wrk::Vector{Float64}) =
-    vec(mapslices(v -> _derivative(t, v, k, x, nu, bc, wrk), c, dims=[2]))
+evaluate!(x::Matrix{Float64}, spline::ParametricSpline, u::AbstractVector) =
+    _evaluate!(x, spline.t, spline.c, spline.k, convert(Vector{Float64}, u), spline.bc, spline.idim, spline.n)
 
-derivative(spline::ParametricSpline, x::AbstractVector, nu::Int=1) =
-    _derivative(spline.t, spline.c, spline.k,
-                convert(Vector{Float64}, x), nu, spline.bc, spline.wrk)
+evaluate!(x::Vector{Float64}, spline::ParametricSpline, u::Real) =
+    _evaluate!(x, spline.t, spline.c, spline.k, u, spline.bc, spline.idim, spline.n)
+
+evaluate(spline::ParametricSpline, u::AbstractVector) =
+    evaluate!(Matrix{Float64}(undef, spline.idim, length(u)), spline, u)
+
+evaluate(spline::ParametricSpline, u::Real) =
+    evaluate!(Vector{Float64}(undef, spline.idim), spline, u)
+
+function _derivative!(x::Matrix{Float64}, t::Vector{Float64}, c::Vector{Float64},
+                      k::Int, u::Vector{Float64}, bc::Int, idim::Int, n::Int,
+                      nu::Int, wrk::Vector{Float64})
+    bc in (0, 1, 2, 3) || error("bc = $bc not in (0, 1, 2, 3)")
+    (1 <= nu <= k) || error("order of derivative must be positive and less than or equal to spline order")
+    m = length(u)
+    size(x, 1) == idim && size(x, 2) == m || error("x must be of size ($idim, $m)")
+    ier = Ref{Int32}(0)
+    ccall((:curder_, libddierckx), Nothing,
+         (Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Int32},
+          Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Int32},
+          Ref{Float64}, Ref{Int32}),
+         idim, t, n, c, length(c), k, nu, u, m, x, length(x), bc, wrk, ier)
+
+    ier[] == 0 || error(_eval1d_messages[ier[]])
+    return x
+end
+
+function _derivative!(x::Vector{Float64}, t::Vector{Float64}, c::Vector{Float64},
+                      k::Int, u::Real, bc::Int, idim::Int, n::Int, nu::Int,
+                      wrk::Vector{Float64})
+    bc in (0, 1, 2, 3) || error("bc = $bc not in (0, 1, 2, 3)")
+    (1 <= nu <= k) || error("order of derivative must be positive and less than or equal to spline order")
+    length(x) == idim || error("x must be of length $idim")
+    ier = Ref{Int32}(0)
+    ccall((:curder_, libddierckx), Nothing,
+         (Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Int32},
+          Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Float64},
+          Ref{Int32}, Ref{Int32},
+          Ref{Float64}, Ref{Int32}),
+         idim, t, n, c, length(c), k, nu, Float64(u), 1, x, length(x), bc, wrk, ier)
+
+    ier[] == 0 || error(_eval1d_messages[ier[]])
+    return x
+end
+
+derivative!(x::Matrix{Float64}, spline::ParametricSpline, u::AbstractVector, nu::Int=1) =
+    _derivative!(x, spline.t, spline.c, spline.k, convert(Vector{Float64}, u), spline.bc, spline.idim, spline.n, nu, spline.wrk)
+
+derivative!(x::Vector{Float64}, spline::ParametricSpline, u::Real, nu::Int=1) =
+    _derivative!(x, spline.t, spline.c, spline.k, u, spline.bc, spline.idim, spline.n, nu, spline.wrk)
+
+derivative(spline::ParametricSpline, u::AbstractVector, nu::Int=1) =
+    derivative!(Matrix{Float64}(undef, spline.idim, length(u)), spline, u, nu)
+
+derivative(spline::ParametricSpline, u::Real, nu::Int=1) =
+    derivative!(Vector{Float64}(undef, spline.idim), spline, u, nu)
 
 # TODO: deprecate this
 derivative(spline::ParametricSpline, x; nu::Int=1) = derivative(spline, x, nu)
-
-derivative(spline::ParametricSpline, x::Real, nu::Int=1) =
-    _derivative(spline.t, spline.c, spline.k, x, nu, spline.bc, spline.wrk)
 
 _integrate(t::Vector{Float64}, c::Matrix{Float64}, k::Int,
            a::Real, b::Real, wrk::Vector{Float64}) =
